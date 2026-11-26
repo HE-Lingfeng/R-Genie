@@ -4,7 +4,10 @@ Prepare source-only conditions with training.cache_transport_intentions. For
 each split, run conditions, velocities and seal in that order. Each row of
 --manifest supplies id, instruction, source, target and their SHA-256 hashes.
 Image paths are relative to --data-root. --base is the Qwen-Image-Edit-2511
-Diffusers directory and --quantized-weight is its Q4_K_M GGUF transformer.
+Diffusers directory (Qwen/Qwen-Image-Edit-2511, revision
+6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9). --quantized-weight is the Q4_K_M
+GGUF transformer from unsloth/Qwen-Image-Edit-2511-GGUF at revision
+52838251db242ddd8e8d0118de36c71006d7c397.
 The conditions and velocities stages support one shard per GPU. Run seal once
 after every shard finishes. Use a separate cache directory for each backbone and
 grounder revision. Pass <cache>/velocities to train_intention_transport.
