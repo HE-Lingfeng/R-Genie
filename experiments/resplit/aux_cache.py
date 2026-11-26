@@ -25,10 +25,13 @@ def main():
     parser.add_argument('--model',type=Path,default=Path('hf_model/FLUX.2-klein-base-4B'))
     parser.add_argument('--data',type=Path,required=True)
     parser.add_argument('--manifests',type=Path,default=Path('artifacts/reditbench-resplit-v2'))
-    parser.add_argument('--validation-prompts',type=Path,required=True,
+    parser.add_argument('--train-only', action='store_true', help='Cache only the explicit training pairs')
+    parser.add_argument('--validation-prompts',type=Path,
                         help='Directory of cached validation prompt embeddings, one <id>.pt per source')
     parser.add_argument('--output',type=Path,default=Path('artifacts/aux-cache'))
     a=parser.parse_args()
+    if not a.train_only and a.validation_prompts is None:
+        parser.error('--validation-prompts is required when caching validation')
     torch.set_num_threads(2);device=torch.device('cuda',a.rank);torch.cuda.set_device(device)
     root=a.model
     folder=a.output;folder.mkdir(parents=True, exist_ok=True)
@@ -50,7 +53,7 @@ def main():
         grid=Flux2KleinPipeline._patchify_latents(vae.encode(pixels).latent_dist.mode())
         return Flux2KleinPipeline._pack_latents((grid-mu)/std)[0].bfloat16().cpu()
     with torch.inference_mode():
-        for split,rows in [('train',train),('validation',val)]:
+        for split,rows in ([('train',train)] if a.train_only else [('train',train),('validation',val)]):
             out=folder/split;out.mkdir(exist_ok=True)
             for n,r in enumerate(rows[a.rank::2]):
                 f=out/(r['id']+'.pt')
