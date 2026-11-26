@@ -1,6 +1,8 @@
 # Separate environment from the legacy Show-o/Transformers 4.44 stack.
 torch>=2.11,<2.12
+torchvision>=0.26,<0.27
 diffusers==0.43.0
+gguf==0.17.1
 transformers==5.20.2
 huggingface_hub==2.4.0
 tokenizers==0.23.3
