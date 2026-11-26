@@ -68,6 +68,8 @@ def main():
     two_ranks("experiments.reasoning.grounding", modes=("full", "latent"))
     run("experiments.reasoning.select_grounder")
     two_ranks("experiments.reasoning.refine_train")
+    two_ranks("experiments.reasoning.readout_cache")
+    two_ranks("experiments.reasoning.readout_train", modes=("lora", "frozen"))
     run("experiments.resplit.explicit_pairs", "--data", DATA, "--manifests", SPLITS)
     two_ranks(
         "experiments.resplit.aux_cache",
