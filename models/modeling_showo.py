@@ -38,7 +38,7 @@ class Showo(ModelMixin, ConfigMixin):
         super().__init__()
         self.vocab_size = vocab_size
         self.register_to_config(mask_token_id=vocab_size - 1)
-        llm_model_path = './hf_model/phi-1_5'
+        llm_model_path = llm_model_path or './hf_model/phi-1_5'
         if load_from_showo:
             config = AutoConfig.from_pretrained(llm_model_path)
             self.showo = PhiForCausalLM(config)

@@ -1,0 +1,15 @@
+# Python 3.11. Install the CUDA build of torch for the training server first.
+torch>=2.5,<3
+transformers==4.44.2
+peft==0.12.0
+diffusers==0.30.3
+accelerate==0.34.2
+omegaconf==2.3.0
+huggingface-hub>=0.25,<1
+safetensors>=0.4.5
+einops>=0.7
+pillow>=10
+numpy>=1.26
+jaxtyping>=0.2
+typeguard<3
+pytest>=8,<9

@@ -752,6 +752,7 @@ class PhiDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        condition_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -806,6 +807,9 @@ class PhiDecoderLayer(nn.Module):
             use_cache=use_cache,
         )
         attn_outputs = self.resid_dropout(attn_outputs)
+        # Eq. (6). An explicit argument also survives checkpoint recomputation.
+        if condition_bias is not None:
+            attn_outputs = attn_outputs + condition_bias[:, None, :].to(attn_outputs.dtype)
 
         feed_forward_hidden_states = self.resid_dropout(self.mlp(hidden_states))
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
