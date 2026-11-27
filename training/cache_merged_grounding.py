@@ -127,6 +127,8 @@ def main():
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--stream-blocks', action='store_true',
                    help='Transfer frozen Qwen blocks from host RAM for each CUDA forward')
+    p.add_argument('--verify-existing', action='store_true',
+                   help='Check stored features on CPU using the extraction device and placement recorded for this cache')
     p.add_argument('--num-threads', default=2, type=int)
     p.add_argument('--shard', default=0, type=int)
     p.add_argument('--shards', default=1, type=int)
@@ -138,7 +140,7 @@ def main():
     device = torch.device(a.device)
     if a.stream_blocks and device.type != 'cuda':
         p.error('--stream-blocks requires a CUDA device')
-    if device.type == 'cuda':
+    if device.type == 'cuda' and not a.verify_existing:
         torch.cuda.set_device(device)
     origin = json.loads((a.model / 'origin.json').read_bytes())
     pinned = json.loads(Path(extractor.__file__).with_name('assets.json').read_bytes())
@@ -146,7 +148,8 @@ def main():
         raise ValueError('Expected the verified Qwen3.5-4B checkpoint')
     rows, manifest_hash = partition_rows(a.merged, a.manifests, a.partition)
     out = a.output / a.partition
-    out.mkdir(parents=True, exist_ok=True)
+    if not a.verify_existing:
+        out.mkdir(parents=True, exist_ok=True)
     identity = dict(partition=a.partition, manifest_sha256=manifest_hash,
                     checkpoint=origin['revision'], extractor_sha256=sha256(extractor.__file__),
                     torch=str(torch.__version__), transformers=transformers.__version__,
@@ -159,6 +162,8 @@ def main():
         if identity_path.exists():
             if json.loads(identity_path.read_bytes()) != identity:
                 raise ValueError(f'Incompatible frozen feature cache at {out}')
+        elif a.verify_existing:
+            raise FileNotFoundError(f'Missing feature cache identity: {identity_path}')
         else:
             atomic_write(identity_path, lambda path: path.write_bytes(json_bytes(identity)))
     model = None
@@ -180,6 +185,8 @@ def main():
             if path.exists():
                 validate(torch.load(path, map_location='cpu', weights_only=True), row)
                 continue
+            if a.verify_existing:
+                raise FileNotFoundError(f'Missing stored features: {path}')
             src = a.merged / row['source']
             if sha256(src) != row['source_sha256']:
                 raise ValueError(f'Source changed for {row["id"]}')
