@@ -101,7 +101,12 @@ def load_streamed_model(path, device):
         return gather_rows(ids.to('cpu')).to(device)
 
     embedding.forward = embed_tokens
-    blocks = [*vision.blocks, *language.layers, vision.merger]
+    # Attention, gate, up and down projections execute in sequence. Each can
+    # release its weights before the next one runs; the layer norms stay resident.
+    blocks = [*vision.blocks, vision.merger]
+    for layer in language.layers:
+        attention = layer.linear_attn if layer.block_type == 'linear_attention' else layer.self_attn
+        blocks.extend((attention, layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj))
     host_weights = {id(parameter) for block in blocks for parameter in block.parameters()}
     for module in model.model.modules():
         for name, parameter in module.named_parameters(recurse=False):
