@@ -18,7 +18,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from training.cache_merged_grounding import atomic_write, partition_rows, validate
-from training.merged_grounder import MergedGrounder, objective
+from training.merged_grounder import MergedGrounder, centroid_shift, objective
 from training.paper_utils import sha256
 from training.prepare_merged_regions import ACTIONS, VERSION
 
@@ -102,7 +102,7 @@ def occupancy_iou(prediction, target):
 def evaluate(model, loader, device):
     model.eval()
     by_action = {op: [] for op in ACTIONS}
-    source, destination, transforms, correct = [], [], [], []
+    source, destination, transforms, placement, correct = [], [], [], [], []
     for batch in loader:
         features, labels = batch_to(batch, device)
         out = model(*features)
@@ -113,13 +113,16 @@ def evaluate(model, loader, device):
         source.extend(occupancy_iou(out['source'][native].sigmoid(), labels['source'][native]).tolist())
         destination.extend(occupancy_iou(out['destination'][geo], labels['destination'][geo]).tolist())
         transforms.extend((out['transform'][geo] - labels['requested_dx_dy_log_scale'][geo]).abs().tolist())
+        expected_shift = centroid_shift(labels['source'][geo], labels['destination'][geo])
+        placement.extend((out['applied_transform'][geo, :2] - expected_shift).abs().tolist())
         correct.extend((out['action'][native].argmax(-1) == labels['action'][native]).tolist())
     if not all(by_action.values()) or not destination:
         raise ValueError('Development partition must cover the seven actions and geometric edits')
     action_ious = {k: sum(v)/len(v) for k, v in by_action.items()}
     return dict(edit_macro_iou=sum(action_ious.values())/len(action_ious), edit_iou_by_action=action_ious,
                 source_iou=float(np.mean(source)), destination_iou=float(np.mean(destination)),
-                action_accuracy=float(np.mean(correct)), transform_mae=np.mean(transforms, axis=0).tolist())
+                action_accuracy=float(np.mean(correct)), transform_mae=np.mean(transforms, axis=0).tolist(),
+                centroid_shift_mae=np.mean(placement, axis=0).tolist())
 
 
 def train(args):

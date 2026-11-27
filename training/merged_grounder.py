@@ -30,11 +30,17 @@ class MergedGrounder(nn.Module):
         self.fuse = nn.Sequential(nn.Linear(3 * width, width), nn.LayerNorm(width), nn.GELU())
         self.action = nn.Linear(width, len(ACTIONS))
         self.transform = nn.Linear(width, 3)
+        self.resize_pivot = nn.Linear(width, 2)
         self.regions = nn.Sequential(
             nn.Conv2d(width + 4, width, 3, padding=1), nn.GroupNorm(8, width), nn.GELU(),
             nn.Conv2d(width, width, 3, padding=2, dilation=2), nn.GELU(), nn.Conv2d(width, 2, 1))
         nn.init.zeros_(self.transform.weight)
         nn.init.zeros_(self.transform.bias)
+        nn.init.zeros_(self.resize_pivot.weight)
+        with torch.no_grad():
+            # The merged fit set uses a bottom-center anchor for resize instructions.
+            # Express the pivot relative to object extent so it scales with object size.
+            self.resize_pivot.bias.copy_(torch.tensor([0., 2/3]).atanh())
         nn.init.zeros_(self.regions[-1].weight)
         nn.init.zeros_(self.regions[-1].bias)
         axis = (torch.arange(16) + 0.5) / 16
@@ -53,7 +59,15 @@ class MergedGrounder(nn.Module):
         hidden = self.fuse(torch.cat((pooled, query, pooled * query), dim=1))
         action = self.action(hidden)
         transform = self.transform(hidden)
-        destination = warp_region(source, transform)
+        weights = source / source.sum(1, keepdim=True).clamp_min(1e-6)
+        centroid = weights @ self.coordinates.T
+        distances = self.coordinates.unsqueeze(0) - centroid.unsqueeze(-1)
+        spread = (weights.unsqueeze(1) * distances.square()).sum(2).clamp_min(1e-8).sqrt()
+        pivot_offset = self.resize_pivot(hidden).tanh() * 3 * spread
+        scale = transform[:, 2:].clamp(-2, 2).exp()
+        shift = transform[:, :2] + (1 - scale) * pivot_offset
+        applied_transform = torch.cat((shift, transform[:, 2:]), dim=1)
+        destination = warp_region(source, applied_transform)
         center = attention @ self.coordinates.T
         relative = self.coordinates.unsqueeze(0) - center.unsqueeze(-1)
         context = (patches * hidden[:, None]).transpose(1, 2)
@@ -66,7 +80,17 @@ class MergedGrounder(nn.Module):
         edit = (1 - p_geometry - p_anchor) * source + p_geometry * torch.maximum(source, destination)
         edit = edit + p_anchor * (anchor - 3).sigmoid()
         return dict(source=source_logits, edit=torch.logit(edit.clamp(1e-5, 1-1e-5)) + correction,
-                    destination=destination, action=action, transform=transform)
+                    destination=destination, action=action, transform=transform,
+                    applied_transform=applied_transform)
+
+
+def centroid_shift(source, destination):
+    axis = (torch.arange(16, device=source.device, dtype=source.dtype) + 0.5) / 16
+    y, x = torch.meshgrid(axis, axis, indexing='ij')
+    coordinates = torch.stack((x.flatten(), y.flatten()), dim=1)
+    def center(mask):
+        return (mask @ coordinates) / mask.sum(1, keepdim=True).clamp_min(1e-6)
+    return center(destination) - center(source)
 
 
 def objective(output, labels):
@@ -84,5 +108,7 @@ def objective(output, labels):
         alignment = F.binary_cross_entropy(probability.clamp(1e-5, 1-1e-5), target) + 1 - dice.mean()
         transform = F.smooth_l1_loss(output['transform'][geometric],
                                      labels['requested_dx_dy_log_scale'][geometric], beta=0.05)
-        loss = loss + alignment + transform
+        shift = centroid_shift(labels['source'][geometric], target)
+        placement = F.smooth_l1_loss(output['applied_transform'][geometric, :2], shift, beta=0.05)
+        loss = loss + alignment + transform + placement
     return loss
