@@ -90,6 +90,42 @@ def batch_to(batch, device):
             {k: v.to(device, non_blocking=True) for k, v in labels.items()})
 
 
+def add_legacy_instances(fit, folder):
+    """Add fit-only COCO source and action labels after validating the original warm-start data."""
+    report_path = folder / 'matches.json'
+    path = folder / 'fit.npz'
+    report = json.loads(report_path.read_bytes())
+    if report['fit_sha256'] != fit.identity['manifest'] or report['regions_sha256'] != sha256(path):
+        raise ValueError('Legacy polygons belong to another fit run')
+    samples = report['samples']
+    by_id = {r['id']: i for i, r in enumerate(fit.rows)}
+    with np.load(path, allow_pickle=False) as record:
+        ids = record['ids'].tolist()
+        if (not ids or len(ids) != len(set(ids)) or ids != [s['id'] for s in samples]
+                or record['source'].shape != (len(ids), 16, 16)
+                or record['annotation_ids'].tolist() != [s['annotation_id'] for s in samples]
+                or str(record['fit_sha256']) != fit.identity['manifest']
+                or str(record['coco_archive_sha256']) != report['coco_archive_sha256']):
+            raise ValueError('Legacy polygon archive disagrees with its registration')
+        masks = torch.from_numpy(record['source']).flatten(1)
+    if not torch.isfinite(masks).all() or (masks < 0).any() or (masks > 1).any() or (masks.sum(1) <= 0).any():
+        raise ValueError('Invalid legacy source occupancies')
+    indices, actions = [], []
+    for sample in samples:
+        index = by_id[sample['id']]
+        row = fit.rows[index]
+        if (row['supervision'] != 'paired-change-only' or bool(fit.labels['has_instance'][index])
+                or row['source_sha256'] != sample['source_sha256'] or row['target_sha256'] != sample['edited_sha256']
+                or sample['operation'] not in ('remove','replace')):
+            raise ValueError('Legacy label disagrees with the original fit pair: '+sample['id'])
+        indices.append(index)
+        actions.append(ACTIONS.index(sample['operation']))
+    fit.labels['source'][indices] = masks
+    fit.labels['action'][indices] = torch.tensor(actions)
+    fit.labels['has_instance'][indices] = True
+    return {'count': len(indices), 'registration_sha256': sha256(report_path), 'regions_sha256': sha256(path)}
+
+
 def occupancy_iou(prediction, target):
     # Fractional target occupancy keeps sub-cell edits in the denominator.
     foreground = (prediction >= 0.5).float()
@@ -211,6 +247,8 @@ def train(args):
                     trainer_code=sha256(__file__), seed=args.seed, batch_size=args.batch_size, world=world, lr=args.lr)
     if init is not None:
         identity['warm_start'] = init
+    if getattr(args, 'legacy_instances', None):
+        identity['legacy_instances'] = add_legacy_instances(data['fit'], args.legacy_instances)
     path = args.output / 'checkpoint.pt'
     best, best_state, history = -1., None, []
     if path.exists():
@@ -255,6 +293,8 @@ if __name__ == '__main__':
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--warm-start',type=Path,
                         help='Directory containing a subset-trained checkpoint.pt and its fit.jsonl, fit.npz and complete-N.json feature receipts')
+    parser.add_argument('--legacy-instances', type=Path,
+                        help='Fit-only source polygons and edit actions from training.prepare_legacy_instances')
     parser.add_argument('--batch-size', type=int, default=16, help='Per-device batch size')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=25)
