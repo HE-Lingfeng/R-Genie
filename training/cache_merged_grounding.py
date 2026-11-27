@@ -70,12 +70,58 @@ def load_model(path, device):
     return model, processor
 
 
+def stream_frozen_block(block, device):
+    slots = [(module, name, parameter)
+             for module in block.modules()
+             for name, parameter in module.named_parameters(recurse=False)]
+
+    def move_weights(*unused):
+        for module, name, parameter in slots:
+            module._parameters[name] = torch.nn.Parameter(parameter.detach().to(device), requires_grad=False)
+
+    def restore_weights(*unused):
+        for module, name, parameter in slots:
+            module._parameters[name] = parameter
+
+    block.register_forward_pre_hook(move_weights)
+    block.register_forward_hook(restore_weights, always_call=True)
+
+
+def load_streamed_model(path, device):
+    """Keep frozen blocks in host memory and execute the original forward on CUDA."""
+    if device.type != 'cuda':
+        raise ValueError('Block streaming requires a CUDA device')
+    model, processor = load_model(path, torch.device('cpu'))
+    vision, language = model.model.visual, model.model.language_model
+    embedding = language.embed_tokens
+    gather_rows = embedding.forward
+
+    def embed_tokens(ids):
+        # Only the gathered vocabulary rows need to cross the device boundary.
+        return gather_rows(ids.to('cpu')).to(device)
+
+    embedding.forward = embed_tokens
+    blocks = [*vision.blocks, *language.layers, vision.merger]
+    host_weights = {id(parameter) for block in blocks for parameter in block.parameters()}
+    for module in model.model.modules():
+        for name, parameter in module.named_parameters(recurse=False):
+            if id(parameter) not in host_weights and module is not embedding:
+                module._parameters[name] = torch.nn.Parameter(parameter.detach().to(device), requires_grad=False)
+        for name, buffer in module.named_buffers(recurse=False):
+            module._buffers[name] = buffer.to(device)
+    for block in blocks:
+        stream_frozen_block(block, device)
+    return model, processor
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('model', 'merged', 'manifests', 'output'):
         p.add_argument('--' + key, type=Path, required=True)
     p.add_argument('--partition', choices=('fit', 'development'), required=True)
     p.add_argument('--device', default='cuda:0')
+    p.add_argument('--stream-blocks', action='store_true',
+                   help='Transfer frozen Qwen blocks from host RAM for each CUDA forward')
     p.add_argument('--num-threads', default=2, type=int)
     p.add_argument('--shard', default=0, type=int)
     p.add_argument('--shards', default=1, type=int)
@@ -85,6 +131,8 @@ def main():
         p.error('Invalid shard, thread count, or limit')
     torch.set_num_threads(a.num_threads)
     device = torch.device(a.device)
+    if a.stream_blocks and device.type != 'cuda':
+        p.error('--stream-blocks requires a CUDA device')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
     origin = json.loads((a.model / 'origin.json').read_bytes())
@@ -98,6 +146,8 @@ def main():
                     checkpoint=origin['revision'], extractor_sha256=sha256(extractor.__file__),
                     torch=str(torch.__version__), transformers=transformers.__version__,
                     backend=device.type, dtype='bfloat16', shards=a.shards)
+    if a.stream_blocks:
+        identity['weight_placement'] = 'streamed-blocks-v1'
     identity_path = out / 'identity.json'
     with (out / '.identity.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -129,7 +179,8 @@ def main():
             if sha256(src) != row['source_sha256']:
                 raise ValueError(f'Source changed for {row["id"]}')
             if model is None:
-                model, processor = load_model(a.model, device)
+                load = load_streamed_model if a.stream_blocks else load_model
+                model, processor = load(a.model, device)
             item = extractor.encode_pair_source(model, processor, src, row['instruction'], device)
             validate(item, row)
             atomic_write(path, lambda tmp: torch.save(item, tmp))
