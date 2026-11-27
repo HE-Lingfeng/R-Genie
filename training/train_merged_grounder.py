@@ -98,6 +98,59 @@ def occupancy_iou(prediction, target):
     return torch.where(area > 0, overlap / area.clamp_min(1e-6), torch.ones_like(area))
 
 
+def init_from_fit(model, folder, fit, dev, model_code):
+    """Initialize from a head trained on a strict subset of this run's fit rows."""
+    path = folder / 'checkpoint.pt'
+    raw = path.read_bytes()
+    state = torch.load(BytesIO(raw), weights_only=True, map_location='cpu')
+    previous = state['identity']
+    if (previous['model_code'] != model_code or previous['actions'] != list(ACTIONS)
+            or previous['extractor'] != fit.extractor or previous['partitions']['development'] != dev.identity):
+        raise ValueError('Pretraining must use the same architecture, extractor and development data')
+    source = previous['partitions']['fit']
+    manifest = folder / 'fit.jsonl'
+    regions = folder / 'fit.npz'
+    if sha256(manifest) != source['manifest'] or sha256(regions) != source['regions']:
+        raise ValueError('Pretraining data differs from the model checkpoint')
+    selected = [json.loads(line) for line in manifest.read_bytes().splitlines()]
+    ids = [r['id'] for r in selected]
+    positions = {r['id']:i for i,r in enumerate(fit.rows)}
+    if (not 0 < len(ids) < len(positions) or len(set(ids)) != len(ids)
+            or any(r['id'] not in positions or r != fit.rows[positions[r['id']]] for r in selected)):
+        raise ValueError('Pretraining rows must be an unmodified subset of full training rows')
+    ix = [positions[i] for i in ids]
+    with np.load(regions, allow_pickle=False) as labels:
+        if (labels['ids'].tolist() != ids or tuple(labels['actions']) != ACTIONS
+                or str(labels['manifest_sha256']) != source['manifest']
+                or int(labels['schema_version']) != VERSION):
+            raise ValueError('Pretraining labels do not match the pretraining split')
+        for key, full in fit.labels.items():
+            expected = full[ix]
+            value = torch.from_numpy(labels[key])
+            if key in ('source','destination','edit'):
+                value = value.flatten(1)
+            if not torch.equal(value, expected):
+                raise ValueError('Pretraining labels differ from full training: ' + key)
+    receipts = {}
+    for i, checksum in enumerate(source['features']):
+        part = folder / f'complete-{i}.json'
+        if sha256(part) != checksum:
+            raise ValueError('Pretraining feature receipt changed')
+        shard = json.loads(part.read_bytes())
+        if shard['count'] != len(shard['sha256']) or receipts.keys() & shard['sha256'].keys():
+            raise ValueError('Pretraining feature shards disagree')
+        receipts.update(shard['sha256'])
+    if receipts != {i:fit.hashes[i] for i in ids}:
+        raise ValueError('Pretraining source features differ from full training')
+    best = max(state['history'], key=lambda row:row['edit_macro_iou'])
+    if not np.isfinite(best['edit_macro_iou']) or best['edit_macro_iou'] != state['best_edit_macro_iou']:
+        raise ValueError('Pretraining model selection is inconsistent')
+    model.load_state_dict(state['best_model'], strict=True)
+    return dict(checkpoint_sha256=hashlib.sha256(raw).hexdigest(), count=len(ids), fit_manifest=source['manifest'],
+                pretraining_trainer=previous['trainer_code'], selected_epoch=best['epoch'],
+                development_edit_macro_iou=best['edit_macro_iou'])
+
+
 @torch.inference_mode()
 def evaluate(model, loader, device):
     model.eval()
@@ -149,11 +202,15 @@ def train(args):
     fit = DataLoader(data['fit'], sampler=train_sampler, **common)
     dev = DataLoader(data['development'], shuffle=False, **common) if rank == 0 else None
     model = MergedGrounder().to(device)
+    model_code = sha256(Path(__file__).with_name('merged_grounder.py'))
+    init = init_from_fit(model,args.warm_start,data['fit'],data['development'],model_code) if getattr(args,'warm_start',None) else None
     wrapped = DistributedDataParallel(model, device_ids=[local] if device.type == 'cuda' else None) if world > 1 else model
     opt = torch.optim.AdamW(wrapped.parameters(), lr=args.lr, weight_decay=0.02)
     identity = dict(partitions={n: d.identity for n, d in data.items()}, extractor=data['fit'].extractor,
-                    actions=list(ACTIONS), model_code=sha256(Path(__file__).with_name('merged_grounder.py')),
+                    actions=list(ACTIONS), model_code=model_code,
                     trainer_code=sha256(__file__), seed=args.seed, batch_size=args.batch_size, world=world, lr=args.lr)
+    if init is not None:
+        identity['warm_start'] = init
     path = args.output / 'checkpoint.pt'
     best, best_state, history = -1., None, []
     if path.exists():
@@ -196,6 +253,8 @@ if __name__ == '__main__':
     for name in ('merged', 'manifests', 'regions', 'cache', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
+    parser.add_argument('--warm-start',type=Path,
+                        help='Directory containing a subset-trained checkpoint.pt and its fit.jsonl, fit.npz and complete-N.json feature receipts')
     parser.add_argument('--batch-size', type=int, default=16, help='Per-device batch size')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--epochs', type=int, default=25)
