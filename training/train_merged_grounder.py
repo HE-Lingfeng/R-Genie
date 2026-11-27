@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from training.cache_merged_grounding import atomic_write, partition_rows, validate
 from training.merged_grounder import MergedGrounder, centroid_shift, objective
+from training.packed_grounding import PackedInputs
 from training.paper_utils import sha256
 from training.prepare_merged_regions import ACTIONS, VERSION
 
@@ -69,11 +70,19 @@ class GroundingData(Dataset):
             self.labels[key] = self.labels[key].flatten(1)
         self.labels['action'] = self.labels['action'].long()
         self.identity = dict(manifest=manifest_hash, regions=sha256(region_path), features=receipts)
+        self.packed = None
+
+    def map_inputs(self, directory):
+        layout = dict(trainer=sha256(Path(__file__)), packer=sha256(Path(__file__).with_name('packed_grounding.py')))
+        self.packed = PackedInputs(self,directory,layout)
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
+        labels = {k: v[i] for k, v in self.labels.items()}
+        if self.packed is not None:
+            return self.packed[i], labels
         row = self.rows[i]
         path = self.directory / (row['id'] + '.pt')
         raw = path.read_bytes()
@@ -81,7 +90,7 @@ class GroundingData(Dataset):
             raise ValueError(f'Changed source features for {row["id"]}')
         features = torch.load(BytesIO(raw), weights_only=True, map_location='cpu')
         validate(features, row)
-        return feature_inputs(features), {k: v[i] for k, v in self.labels.items()}
+        return feature_inputs(features), labels
 
 
 def batch_to(batch, device):
@@ -187,6 +196,29 @@ def init_from_fit(model, folder, fit, dev, model_code):
                 development_edit_macro_iou=best['edit_macro_iou'])
 
 
+def init_from_cues(model, path, parent, fit, dev, model_code):
+    if parent is None:
+        raise ValueError('A cue refinement requires its original warm-start checkpoint')
+    raw=path.read_bytes()
+    state=torch.load(BytesIO(raw),weights_only=True,map_location='cpu')
+    info=state['identity']
+    if (info['parent']!=parent['checkpoint_sha256'] or info['fit_manifest']!=fit.identity['manifest']
+            or info['model_code']!=model_code or info['training_code']!=sha256(Path(__file__).with_name('train_cue_alignment.py'))
+            or any(info['paired_extractor'][k]!=fit.extractor[k] for k in ('checkpoint','extractor_sha256','dtype'))):
+        raise ValueError('The cue pretraining data, encoder or parent differs')
+    rows={r['id']:r for r in fit.rows}
+    dev_groups={r['source_group'] for r in dev.rows}
+    paired,ordinary=info['paired_sources'],info['rehearsal_sources']
+    if not paired or not ordinary or paired.keys() & ordinary.keys():
+        raise ValueError('Invalid paired and ordinary cue pretraining groups')
+    for uid,digest in {**paired,**ordinary}.items():
+        if uid not in rows or rows[uid]['source_sha256']!=digest or rows[uid]['source_group'] in dev_groups:
+            raise ValueError('Cue pretraining used a source outside the fit partition')
+    model.load_state_dict(state['model'],strict=True)
+    return dict(checkpoint_sha256=hashlib.sha256(raw).hexdigest(),parent=info['parent'],paired_count=len(paired),
+                rehearsal_count=len(ordinary),spec_sha256=info['spec_sha256'],training_code=info['training_code'])
+
+
 @torch.inference_mode()
 def evaluate(model, loader, device):
     model.eval()
@@ -231,6 +263,9 @@ def train(args):
     torch.manual_seed(args.seed)
     data = {name: GroundingData(args.merged, args.manifests, args.regions, args.cache, name)
             for name in ('fit', 'development')}
+    if getattr(args, 'packed_inputs', None):
+        for name, partition in data.items():
+            partition.map_inputs(args.packed_inputs / name)
     if data['fit'].extractor != data['development'].extractor:
         raise ValueError('Use the same readout configuration on both partitions')
     common = dict(batch_size=args.batch_size, num_workers=args.workers, pin_memory=device.type == 'cuda')
@@ -240,6 +275,8 @@ def train(args):
     model = MergedGrounder().to(device)
     model_code = sha256(Path(__file__).with_name('merged_grounder.py'))
     init = init_from_fit(model,args.warm_start,data['fit'],data['development'],model_code) if getattr(args,'warm_start',None) else None
+    cue_init = (init_from_cues(model,args.cue_warm_start,init,data['fit'],data['development'],model_code)
+                if getattr(args,'cue_warm_start',None) else None)
     wrapped = DistributedDataParallel(model, device_ids=[local] if device.type == 'cuda' else None) if world > 1 else model
     opt = torch.optim.AdamW(wrapped.parameters(), lr=args.lr, weight_decay=0.02)
     identity = dict(partitions={n: d.identity for n, d in data.items()}, extractor=data['fit'].extractor,
@@ -247,6 +284,8 @@ def train(args):
                     trainer_code=sha256(__file__), seed=args.seed, batch_size=args.batch_size, world=world, lr=args.lr)
     if init is not None:
         identity['warm_start'] = init
+    if cue_init is not None:
+        identity['cue_warm_start'] = cue_init
     if getattr(args, 'legacy_instances', None):
         identity['legacy_instances'] = add_legacy_instances(data['fit'], args.legacy_instances)
     path = args.output / 'checkpoint.pt'
@@ -291,8 +330,12 @@ if __name__ == '__main__':
     for name in ('merged', 'manifests', 'regions', 'cache', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
+    parser.add_argument('--packed-inputs', type=Path,
+                        help='Optional local directory for sharing verified, memory-mapped inputs across epochs')
     parser.add_argument('--warm-start',type=Path,
                         help='Directory containing a subset-trained checkpoint.pt and its fit.jsonl, fit.npz and complete-N.json feature receipts')
+    parser.add_argument('--cue-warm-start',type=Path,
+                        help='Optional same-photo cue refinement from training.train_cue_alignment')
     parser.add_argument('--legacy-instances', type=Path,
                         help='Fit-only source polygons and edit actions from training.prepare_legacy_instances')
     parser.add_argument('--batch-size', type=int, default=16, help='Per-device batch size')
